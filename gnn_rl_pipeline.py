@@ -770,6 +770,14 @@ def beam_search_path_length(G: nx.Graph, start: int, goal: int, beam_width: int 
         frontier = heapq.nsmallest(beam_width, new_frontier)
     return float('inf')
 
+
+def _safe_path_length(func, *args, **kwargs) -> float:
+    """Wrapper returning infinity when no path exists."""
+    try:
+        return func(*args, **kwargs)
+    except nx.NetworkXNoPath:
+        return float('inf')
+
 # RL 플랜의 총 이동 거리 계산
 id_to_idx = {fac.iloc[i]["AssetID"]: i for i in range(num_fac)}
 def rl_total_distance(assign_list: List[Tuple[str, str]], assembly_idx: int) -> float:
@@ -777,14 +785,17 @@ def rl_total_distance(assign_list: List[Tuple[str, str]], assembly_idx: int) -> 
     seq.append(assembly_idx)
     total = 0.0
     for a, b in zip(seq[:-1], seq[1:]):
-        total += nx.dijkstra_path_length(G, a, b, weight='weight')
+        dist = _safe_path_length(nx.dijkstra_path_length, G, a, b, weight='weight')
+        if math.isinf(dist):
+            return float('inf')
+        total += dist
     return total
 
 start_idx = id_to_idx[assignments[0][1]]
 assembly_idx = int(asm_idx[0]) if len(asm_idx) > 0 else start_idx
 
-dijkstra_len = nx.dijkstra_path_length(G, start_idx, assembly_idx, weight='weight')
-astar_len = nx.astar_path_length(G, start_idx, assembly_idx, heuristic=_heuristic, weight='weight')
+dijkstra_len = _safe_path_length(nx.dijkstra_path_length, G, start_idx, assembly_idx, weight='weight')
+astar_len = _safe_path_length(nx.astar_path_length, G, start_idx, assembly_idx, heuristic=_heuristic, weight='weight')
 beam_len = beam_search_path_length(G, start_idx, assembly_idx, beam_width=3)
 rl_len = rl_total_distance(assignments, assembly_idx)
 
