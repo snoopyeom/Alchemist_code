@@ -23,6 +23,7 @@ from torch import nn
 from torch_geometric.data import Data, HeteroData
 from torch_geometric.nn import SAGEConv
 import folium
+import networkx as nx
 
 # =========================================================
 # 0) PATHS: relative-first; AAS falls back to absolute
@@ -737,6 +738,61 @@ print("\n[RL] Assignments:")
 for p, f_id in assignments:
     print(f" - {p} → {f_id}")
 print(f"[RL] Legacy distance ≈ {env.total_distance:.2f} km, flow ≈ {flow_km:.2f} km")
+
+# ---------------------------------------------------------
+# A*, Dijkstra, Beam Search와의 거리 비교
+# ---------------------------------------------------------
+# 시설 그래프 생성
+G = nx.Graph()
+for i in range(num_fac):
+    G.add_node(i, lat=float(lat[i]), lon=float(lon[i]))
+for (s, t), (dkm, _) in zip(edges_ff, attrs_ff):
+    if not G.has_edge(s, t) or G[s][t]['weight'] > dkm:
+        G.add_edge(s, t, weight=float(dkm))
+
+# 휴리스틱 함수(A*)
+def _heuristic(u: int, v: int) -> float:
+    n1, n2 = G.nodes[u], G.nodes[v]
+    return haversine(n1['lat'], n1['lon'], n2['lat'], n2['lon'])
+
+# Beam Search 간단 구현
+def beam_search_path_length(G: nx.Graph, start: int, goal: int, beam_width: int = 3) -> float:
+    import heapq
+    frontier = [(0.0, [start])]
+    while frontier:
+        new_frontier = []
+        for cost, path in frontier:
+            node = path[-1]
+            if node == goal:
+                return cost
+            for nb, data in G[node].items():
+                heapq.heappush(new_frontier, (cost + data['weight'], path + [nb]))
+        frontier = heapq.nsmallest(beam_width, new_frontier)
+    return float('inf')
+
+# RL 플랜의 총 이동 거리 계산
+id_to_idx = {fac.iloc[i]["AssetID"]: i for i in range(num_fac)}
+def rl_total_distance(assign_list: List[Tuple[str, str]], assembly_idx: int) -> float:
+    seq = [id_to_idx[fid] for _, fid in assign_list]
+    seq.append(assembly_idx)
+    total = 0.0
+    for a, b in zip(seq[:-1], seq[1:]):
+        total += nx.dijkstra_path_length(G, a, b, weight='weight')
+    return total
+
+start_idx = id_to_idx[assignments[0][1]]
+assembly_idx = int(asm_idx[0]) if len(asm_idx) > 0 else start_idx
+
+dijkstra_len = nx.dijkstra_path_length(G, start_idx, assembly_idx, weight='weight')
+astar_len = nx.astar_path_length(G, start_idx, assembly_idx, heuristic=_heuristic, weight='weight')
+beam_len = beam_search_path_length(G, start_idx, assembly_idx, beam_width=3)
+rl_len = rl_total_distance(assignments, assembly_idx)
+
+print("\n[COMPARE] 총 소요 거리 (km)")
+print(f" - Dijkstra   : {dijkstra_len:.2f}")
+print(f" - A*         : {astar_len:.2f}")
+print(f" - Beam Search: {beam_len:.2f}")
+print(f" - GNN+RL(top1): {rl_len:.2f}")
 
 def visualize_sequence_route(plan: List[Tuple[str,str]], env, output_html: str, color: str = "blue"):
     """플랜 방문 순서를 직선 폴리라인으로 시각화"""
