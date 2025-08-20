@@ -23,7 +23,6 @@ from torch import nn
 from torch_geometric.data import Data, HeteroData
 from torch_geometric.nn import SAGEConv
 import folium
-import networkx as nx
 
 # =========================================================
 # 0) PATHS: relative-first; AAS falls back to absolute
@@ -250,7 +249,8 @@ def haversine(lat1, lon1, lat2, lon2):
     return R*2*np.arctan2(np.sqrt(a), np.sqrt(1-a))
 
 # fac↔fac KNN travel edges
-K = max(1, min(5, len(fac)-1))
+# 기존에는 K=5 근방으로 제한되어 경로가 단절될 수 있어 K 범위를 넓혔다.
+K = max(5, min(15, len(fac)-1))
 D = haversine(lat[:,None], lon[:,None], lat[None,:], lon[None,:])
 np.fill_diagonal(D, np.inf)
 nn_idx = np.argpartition(D, K, axis=1)[:, :K]
@@ -466,7 +466,7 @@ class FacilityAssignmentEnv:
     fac_ids: List[str]
     fac_type: pd.Series
     alpha: float = 1.0
-    gamma: float = 100.0
+    gamma: float = 1.0
 
     def reset(self):
         self.step_idx = 0
@@ -701,7 +701,7 @@ env = FacilityAssignmentEnv(
     num_proc=num_part, num_fac=num_fac,
     dmap=dmap_global, gnn=gnn_scores, cand_by_part=cand_by_part,
     fac_lat=lat, fac_lon=lon, fac_ids=fac["AssetID"].tolist(), fac_type=fac["fac_type"],
-    alpha=1.0, gamma=100.0,
+    alpha=1.0, gamma=1.0,
 )
 agent = QLearningAgent(num_part, num_fac, lr=0.25, gamma=0.95, eps=0.2)
 
@@ -740,98 +740,54 @@ for p, f_id in assignments:
 print(f"[RL] Legacy distance ≈ {env.total_distance:.2f} km, flow ≈ {flow_km:.2f} km")
 
 # ---------------------------------------------------------
-# A*, Dijkstra, Beam Search와의 거리 비교
+# Greedy baseline과의 물류 이동 거리 비교
 # ---------------------------------------------------------
-MAX_FAC_FOR_COMPARE = 200
-beam_width = 3
-max_expansion = 10000
-if num_fac > MAX_FAC_FOR_COMPARE:
-    print(f"\n[WARN] 시설 수가 {num_fac}개로 많지만 경로 비교를 수행합니다 (>{MAX_FAC_FOR_COMPARE}).")
-    beam_width = 2
-    max_expansion = 2000
 
-# 시설 그래프 생성
-G = nx.Graph()
-for i in range(num_fac):
-    G.add_node(i, lat=float(lat[i]), lon=float(lon[i]))
-for (s, t), (dkm, _) in zip(edges_ff, attrs_ff):
-    if not G.has_edge(s, t) or G[s][t]['weight'] > dkm:
-        G.add_edge(s, t, weight=float(dkm))
+def greedy_baseline_plan(env: FacilityAssignmentEnv) -> List[Tuple[str, str]]:
+    """Assembly 후보를 중심으로 단순 탐욕 배정을 수행"""
+    asm_idx = PARTS.index("Assembly")
+    asm_cands = env.cand_by_part.get(asm_idx, []) or [0]
+    best_asm, best_cost = asm_cands[0], float("inf")
+    for asm in asm_cands:
+        cost = 0.0
+        for part in ["Supporter","Bracket","Shaft","Sheet","Hinge Assy","Washer"]:
+            p_idx = PARTS.index(part)
+            cands = env.cand_by_part.get(p_idx, [])
+            if cands:
+                cost += min(env._haversine_fac(c, asm) for c in cands)
+        w_cands = env.cand_by_part.get(PARTS.index("Washer"), [])
+        b_cands = env.cand_by_part.get(PARTS.index("Bush"), [])
+        if w_cands and b_cands:
+            w = min(w_cands, key=lambda c: env._haversine_fac(c, asm))
+            cost += min(env._haversine_fac(w, b)+env._haversine_fac(b, asm) for b in b_cands)
+        if cost < best_cost:
+            best_cost, best_asm = cost, asm
+    plan: List[Tuple[str,str]] = [("Assembly", env.fac_ids[best_asm])]
+    w_cands = env.cand_by_part.get(PARTS.index("Washer"), [])
+    washer = min(w_cands, key=lambda c: env._haversine_fac(c, best_asm)) if w_cands else None
+    if washer is not None:
+        plan.append(("Washer", env.fac_ids[washer]))
+    b_cands = env.cand_by_part.get(PARTS.index("Bush"), [])
+    if b_cands:
+        if washer is not None:
+            bush = min(b_cands, key=lambda c: env._haversine_fac(washer, c)+env._haversine_fac(c, best_asm))
+        else:
+            bush = min(b_cands, key=lambda c: env._haversine_fac(c, best_asm))
+        plan.append(("Bush", env.fac_ids[bush]))
+    for part in ["Supporter","Bracket","Shaft","Sheet","Hinge Assy"]:
+        p_idx = PARTS.index(part)
+        cands = env.cand_by_part.get(p_idx, [])
+        if cands:
+            best = min(cands, key=lambda c: env._haversine_fac(c, best_asm))
+            plan.append((part, env.fac_ids[best]))
+    return plan
 
-# 휴리스틱 함수(A*)
-def _heuristic(u: int, v: int) -> float:
-    n1, n2 = G.nodes[u], G.nodes[v]
-    return haversine(n1['lat'], n1['lon'], n2['lat'], n2['lon'])
+greedy_plan = greedy_baseline_plan(env)
+greedy_flow_km, _ = compute_material_flow_distance(greedy_plan, env)
 
-# Beam Search 간단 구현
-def beam_search_path_length(
-    G: nx.Graph, start: int, goal: int, beam_width: int = 3, max_expansion: int = 10000
-) -> float:
-    import heapq
-    frontier = [(0.0, [start])]
-    expansions = 0
-    while frontier and expansions < max_expansion:
-        new_frontier = []
-        for cost, path in frontier:
-            node = path[-1]
-            if node == goal:
-                return cost
-            for nb, data in G[node].items():
-                heapq.heappush(new_frontier, (cost + data['weight'], path + [nb]))
-                expansions += 1
-                if expansions >= max_expansion:
-                    break
-            if expansions >= max_expansion:
-                break
-        frontier = heapq.nsmallest(beam_width, new_frontier)
-    return float('inf')
-
-def _safe_path_length(func, G: nx.Graph, src: int, dst: int, **kwargs) -> float:
-    """경로가 없을 때는 허브시안 거리로 대체"""
-    try:
-        result = func(G, src, dst, **kwargs)
-    except nx.NetworkXNoPath:
-        result = float('inf')
-    if math.isinf(result):
-        n1, n2 = G.nodes[src], G.nodes[dst]
-        lat1, lon1 = float(n1.get('lat', 0)), float(n1.get('lon', 0))
-        lat2, lon2 = float(n2.get('lat', 0)), float(n2.get('lon', 0))
-        return haversine(lat1, lon1, lat2, lon2)
-    return result
-
-# RL 플랜의 총 이동 거리 계산
-id_to_idx = {fac.iloc[i]["AssetID"]: i for i in range(num_fac)}
-def rl_total_distance(assign_list: List[Tuple[str, str]], assembly_idx: int) -> float:
-    seq = [id_to_idx[fid] for _, fid in assign_list]
-    seq.append(assembly_idx)
-    total = 0.0
-    for a, b in zip(seq[:-1], seq[1:]):
-        dist = _safe_path_length(nx.dijkstra_path_length, G, a, b, weight='weight')
-        if math.isinf(dist):
-            return float('inf')
-        total += dist
-    return total
-
-start_idx = id_to_idx[assignments[0][1]]
-assembly_idx = int(asm_idx[0]) if len(asm_idx) > 0 else start_idx
-
-dijkstra_len = _safe_path_length(nx.dijkstra_path_length, G, start_idx, assembly_idx, weight='weight')
-astar_len = _safe_path_length(nx.astar_path_length, G, start_idx, assembly_idx, heuristic=_heuristic, weight='weight')
-beam_len = _safe_path_length(
-    beam_search_path_length,
-    G,
-    start_idx,
-    assembly_idx,
-    beam_width=beam_width,
-    max_expansion=max_expansion,
-)
-rl_len = rl_total_distance(assignments, assembly_idx)
-
-print("\n[COMPARE] 총 소요 거리 (km)")
-print(f" - Dijkstra   : {dijkstra_len:.2f}")
-print(f" - A*         : {astar_len:.2f}")
-print(f" - Beam Search: {beam_len:.2f}")
-print(f" - GNN+RL(top1): {rl_len:.2f}")
+print("\n[COMPARE-FAIR] 총 물류 이동 거리 (km)")
+print(f" - Greedy      : {greedy_flow_km:.2f}")
+print(f" - GNN+RL(top1): {flow_km:.2f}")
 
 def visualize_sequence_route(plan: List[Tuple[str,str]], env, output_html: str, color: str = "blue"):
     """플랜 방문 순서를 직선 폴리라인으로 시각화"""
