@@ -742,68 +742,71 @@ print(f"[RL] Legacy distance ≈ {env.total_distance:.2f} km, flow ≈ {flow_km:
 # ---------------------------------------------------------
 # A*, Dijkstra, Beam Search와의 거리 비교
 # ---------------------------------------------------------
-# 시설 그래프 생성
-G = nx.Graph()
-for i in range(num_fac):
-    G.add_node(i, lat=float(lat[i]), lon=float(lon[i]))
-for (s, t), (dkm, _) in zip(edges_ff, attrs_ff):
-    if not G.has_edge(s, t) or G[s][t]['weight'] > dkm:
-        G.add_edge(s, t, weight=float(dkm))
+MAX_FAC_FOR_COMPARE = 200
+if num_fac <= MAX_FAC_FOR_COMPARE:
+    # 시설 그래프 생성
+    G = nx.Graph()
+    for i in range(num_fac):
+        G.add_node(i, lat=float(lat[i]), lon=float(lon[i]))
+    for (s, t), (dkm, _) in zip(edges_ff, attrs_ff):
+        if not G.has_edge(s, t) or G[s][t]['weight'] > dkm:
+            G.add_edge(s, t, weight=float(dkm))
 
-# 휴리스틱 함수(A*)
-def _heuristic(u: int, v: int) -> float:
-    n1, n2 = G.nodes[u], G.nodes[v]
-    return haversine(n1['lat'], n1['lon'], n2['lat'], n2['lon'])
+    # 휴리스틱 함수(A*)
+    def _heuristic(u: int, v: int) -> float:
+        n1, n2 = G.nodes[u], G.nodes[v]
+        return haversine(n1['lat'], n1['lon'], n2['lat'], n2['lon'])
 
-# Beam Search 간단 구현
-def beam_search_path_length(G: nx.Graph, start: int, goal: int, beam_width: int = 3) -> float:
-    import heapq
-    frontier = [(0.0, [start])]
-    while frontier:
-        new_frontier = []
-        for cost, path in frontier:
-            node = path[-1]
-            if node == goal:
-                return cost
-            for nb, data in G[node].items():
-                heapq.heappush(new_frontier, (cost + data['weight'], path + [nb]))
-        frontier = heapq.nsmallest(beam_width, new_frontier)
-    return float('inf')
-
-
-def _safe_path_length(func, *args, **kwargs) -> float:
-    """Wrapper returning infinity when no path exists."""
-    try:
-        return func(*args, **kwargs)
-    except nx.NetworkXNoPath:
+    # Beam Search 간단 구현
+    def beam_search_path_length(G: nx.Graph, start: int, goal: int, beam_width: int = 3) -> float:
+        import heapq
+        frontier = [(0.0, [start])]
+        while frontier:
+            new_frontier = []
+            for cost, path in frontier:
+                node = path[-1]
+                if node == goal:
+                    return cost
+                for nb, data in G[node].items():
+                    heapq.heappush(new_frontier, (cost + data['weight'], path + [nb]))
+            frontier = heapq.nsmallest(beam_width, new_frontier)
         return float('inf')
 
-# RL 플랜의 총 이동 거리 계산
-id_to_idx = {fac.iloc[i]["AssetID"]: i for i in range(num_fac)}
-def rl_total_distance(assign_list: List[Tuple[str, str]], assembly_idx: int) -> float:
-    seq = [id_to_idx[fid] for _, fid in assign_list]
-    seq.append(assembly_idx)
-    total = 0.0
-    for a, b in zip(seq[:-1], seq[1:]):
-        dist = _safe_path_length(nx.dijkstra_path_length, G, a, b, weight='weight')
-        if math.isinf(dist):
+    def _safe_path_length(func, *args, **kwargs) -> float:
+        """Wrapper returning infinity when no path exists."""
+        try:
+            return func(*args, **kwargs)
+        except nx.NetworkXNoPath:
             return float('inf')
-        total += dist
-    return total
 
-start_idx = id_to_idx[assignments[0][1]]
-assembly_idx = int(asm_idx[0]) if len(asm_idx) > 0 else start_idx
+    # RL 플랜의 총 이동 거리 계산
+    id_to_idx = {fac.iloc[i]["AssetID"]: i for i in range(num_fac)}
+    def rl_total_distance(assign_list: List[Tuple[str, str]], assembly_idx: int) -> float:
+        seq = [id_to_idx[fid] for _, fid in assign_list]
+        seq.append(assembly_idx)
+        total = 0.0
+        for a, b in zip(seq[:-1], seq[1:]):
+            dist = _safe_path_length(nx.dijkstra_path_length, G, a, b, weight='weight')
+            if math.isinf(dist):
+                return float('inf')
+            total += dist
+        return total
 
-dijkstra_len = _safe_path_length(nx.dijkstra_path_length, G, start_idx, assembly_idx, weight='weight')
-astar_len = _safe_path_length(nx.astar_path_length, G, start_idx, assembly_idx, heuristic=_heuristic, weight='weight')
-beam_len = beam_search_path_length(G, start_idx, assembly_idx, beam_width=3)
-rl_len = rl_total_distance(assignments, assembly_idx)
+    start_idx = id_to_idx[assignments[0][1]]
+    assembly_idx = int(asm_idx[0]) if len(asm_idx) > 0 else start_idx
 
-print("\n[COMPARE] 총 소요 거리 (km)")
-print(f" - Dijkstra   : {dijkstra_len:.2f}")
-print(f" - A*         : {astar_len:.2f}")
-print(f" - Beam Search: {beam_len:.2f}")
-print(f" - GNN+RL(top1): {rl_len:.2f}")
+    dijkstra_len = _safe_path_length(nx.dijkstra_path_length, G, start_idx, assembly_idx, weight='weight')
+    astar_len = _safe_path_length(nx.astar_path_length, G, start_idx, assembly_idx, heuristic=_heuristic, weight='weight')
+    beam_len = beam_search_path_length(G, start_idx, assembly_idx, beam_width=3)
+    rl_len = rl_total_distance(assignments, assembly_idx)
+
+    print("\n[COMPARE] 총 소요 거리 (km)")
+    print(f" - Dijkstra   : {dijkstra_len:.2f}")
+    print(f" - A*         : {astar_len:.2f}")
+    print(f" - Beam Search: {beam_len:.2f}")
+    print(f" - GNN+RL(top1): {rl_len:.2f}")
+else:
+    print(f"\n[SKIP] 시설 수가 {num_fac}개로 많아 경로 비교를 생략합니다 (>{MAX_FAC_FOR_COMPARE}).")
 
 def visualize_sequence_route(plan: List[Tuple[str,str]], env, output_html: str, color: str = "blue"):
     """플랜 방문 순서를 직선 폴리라인으로 시각화"""
@@ -863,7 +866,7 @@ def visualize_material_flow(plan: List[Tuple[str, str]], env, output_html: str):
     m.save(output_html)
     print(f"[FLOW-MAP] total_flow={total_km:.2f} km → {os.path.abspath(output_html)}")
 
-def rollout_topk_with_rl(env, agent, k=10, n_samples=3000, tau=1.0, tau_decay=0.95,
+def rollout_topk_with_rl(env, agent, k=10, n_samples=300, tau=1.0, tau_decay=0.95,
                          use_flow_as_cost: bool = True,
                          save_sequence_map: bool = False,
                          save_flow_map: bool = True):
@@ -896,7 +899,8 @@ def rollout_topk_with_rl(env, agent, k=10, n_samples=3000, tau=1.0, tau_decay=0.
     current_tau = tau
     while len(top) < k:
         results: List[Tuple[float, float, List[Tuple[str, str]]]] = []
-        for _ in range(n_samples):
+        progress_int = max(1, n_samples // 10)
+        for i in range(n_samples):
             s = env.reset()
             done = False
             plan: List[Tuple[str, str]] = []
@@ -916,10 +920,14 @@ def rollout_topk_with_rl(env, agent, k=10, n_samples=3000, tau=1.0, tau_decay=0.
                 total_reward += r
             path_key = tuple(fac_id for _, fac_id in plan)
             if path_key in banned:
+                if (i + 1) % progress_int == 0:
+                    print(f"   sample {i + 1}/{n_samples} for rank {rank}")
                 continue
             flow_km = env.flow_distance
             cost = flow_km if use_flow_as_cost else -total_reward
             results.append((cost, flow_km, plan))
+            if (i + 1) % progress_int == 0:
+                print(f"   sample {i + 1}/{n_samples} for rank {rank}")
         unique: Dict[Tuple[str, ...], Tuple[float, float, List[Tuple[str, str]]]] = {}
         for cost, flow_km, plan in results:
             key = tuple(fac_id for _, fac_id in plan)
