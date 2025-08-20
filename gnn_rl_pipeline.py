@@ -786,12 +786,18 @@ def beam_search_path_length(
         frontier = heapq.nsmallest(beam_width, new_frontier)
     return float('inf')
 
-def _safe_path_length(func, *args, **kwargs) -> float:
-    """Wrapper returning infinity when no path exists."""
+def _safe_path_length(func, G: nx.Graph, src: int, dst: int, **kwargs) -> float:
+    """경로가 없을 때는 허브시안 거리로 대체"""
     try:
-        return func(*args, **kwargs)
+        result = func(G, src, dst, **kwargs)
     except nx.NetworkXNoPath:
-        return float('inf')
+        result = float('inf')
+    if math.isinf(result):
+        n1, n2 = G.nodes[src], G.nodes[dst]
+        lat1, lon1 = float(n1.get('lat', 0)), float(n1.get('lon', 0))
+        lat2, lon2 = float(n2.get('lat', 0)), float(n2.get('lon', 0))
+        return haversine(lat1, lon1, lat2, lon2)
+    return result
 
 # RL 플랜의 총 이동 거리 계산
 id_to_idx = {fac.iloc[i]["AssetID"]: i for i in range(num_fac)}
@@ -811,8 +817,13 @@ assembly_idx = int(asm_idx[0]) if len(asm_idx) > 0 else start_idx
 
 dijkstra_len = _safe_path_length(nx.dijkstra_path_length, G, start_idx, assembly_idx, weight='weight')
 astar_len = _safe_path_length(nx.astar_path_length, G, start_idx, assembly_idx, heuristic=_heuristic, weight='weight')
-beam_len = beam_search_path_length(
-    G, start_idx, assembly_idx, beam_width=beam_width, max_expansion=max_expansion
+beam_len = _safe_path_length(
+    beam_search_path_length,
+    G,
+    start_idx,
+    assembly_idx,
+    beam_width=beam_width,
+    max_expansion=max_expansion,
 )
 rl_len = rl_total_distance(assignments, assembly_idx)
 
